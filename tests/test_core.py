@@ -5,6 +5,7 @@ from pathlib import Path
 
 from scrapi_reddit.core import (
     BASE_URL,
+    ListingTarget,
     ScrapeOptions,
     derive_filename,
     extract_links,
@@ -54,7 +55,14 @@ def test_derive_filename_includes_rank_and_slug():
 
 def test_rebuild_csv_from_cache(tmp_path: Path):
     subreddit = "example"
-    base_dir = tmp_path / subreddit
+    target = ListingTarget(
+        label="r/example top (day)",
+        output_segments=("subreddits", "example", "top_day"),
+        url=f"{BASE_URL}/r/{subreddit}/top/.json",
+        params={"t": "day"},
+        context=subreddit,
+    )
+    base_dir = target.output_dir(tmp_path)
     posts_dir = base_dir / "post_jsons"
     posts_dir.mkdir(parents=True)
 
@@ -112,7 +120,7 @@ def test_rebuild_csv_from_cache(tmp_path: Path):
         encoding="utf-8",
     )
 
-    rebuild_csv_from_cache(subreddit, tmp_path)
+    rebuild_csv_from_cache(target, tmp_path)
 
     posts_csv = (base_dir / "posts.csv").read_text(encoding="utf-8")
     comments_csv = (base_dir / "comments.csv").read_text(encoding="utf-8")

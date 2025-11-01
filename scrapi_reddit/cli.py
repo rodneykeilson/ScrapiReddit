@@ -3,16 +3,21 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 from typing import List, Sequence
+from urllib.parse import parse_qsl, urlsplit
 
 from .core import (
+    BASE_URL,
     DEFAULT_USER_AGENT,
+    ListingTarget,
     ScrapeOptions,
     build_session,
-    process_subreddit,
+    process_listing,
     rebuild_csv_from_cache,
+    shorten_component,
 )
 
 
@@ -35,7 +40,202 @@ def _resolve_subreddits(args_subreddits: Sequence[str], prompt: bool) -> List[st
     if prompt:
         raw = input("Enter subreddit names (comma-separated): ").strip()
         return [name.strip() for name in raw.split(",") if name.strip()]
-    raise SystemExit("No subreddits provided. Use --prompt for interactive input.")
+    return []
+
+
+def _parse_csv(value: str, *, default: str | None = None) -> List[str]:
+    raw = value if value is not None else default
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _validate_choices(values: List[str], allowed: set[str], option_name: str) -> None:
+    invalid = [v for v in values if v not in allowed]
+    if invalid:
+        allowed_list = ", ".join(sorted(allowed))
+        raise SystemExit(f"Invalid value(s) for {option_name}: {invalid}. Allowed: {allowed_list}")
+
+
+def _slugify(text: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", text.strip())
+    return slug or "item"
+
+
+def _target_from_url(url: str) -> ListingTarget:
+    parsed = urlsplit(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise SystemExit(f"Listing URL must be absolute (including https://): {url}")
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    slug_source = parsed.netloc + (parsed.path or "/")
+    if parsed.query:
+        slug_source += "?" + parsed.query
+    slug = shorten_component(_slugify(slug_source), 80)
+    return ListingTarget(
+        label=f"custom {parsed.netloc}{parsed.path}",
+        output_segments=("custom", slug),
+        url=base_url,
+        params=params,
+        context="custom",
+    )
+
+
+def _build_targets(
+    subreddits: List[str],
+    *,
+    subreddit_sorts: List[str],
+    subreddit_top_times: List[str],
+    include_frontpage: bool,
+    include_r_all: bool,
+    include_popular: bool,
+    popular_sorts: List[str],
+    popular_top_times: List[str],
+    popular_geo: List[str],
+    users: List[str],
+    user_sections: List[str],
+    user_sorts: List[str],
+    listing_urls: List[str],
+) -> List[ListingTarget]:
+    targets: List[ListingTarget] = []
+
+    allowed_subreddit_sorts = {"default", "top", "best", "hot", "new", "rising"}
+    _validate_choices(subreddit_sorts, allowed_subreddit_sorts, "--subreddit-sorts")
+    allowed_time_filters = {"hour", "day", "week", "month", "year", "all"}
+    if "top" in subreddit_sorts:
+        _validate_choices(subreddit_top_times, allowed_time_filters, "--subreddit-top-times")
+
+    for subreddit in subreddits:
+        slug_name = _slugify(subreddit)
+        for sort in subreddit_sorts:
+            if sort == "default":
+                targets.append(
+                    ListingTarget(
+                        label=f"r/{subreddit} (default)",
+                        output_segments=("subreddits", slug_name, "default"),
+                        url=f"{BASE_URL}/r/{subreddit}/.json",
+                        context=subreddit,
+                    )
+                )
+            elif sort == "top":
+                for timeframe in subreddit_top_times:
+                    targets.append(
+                        ListingTarget(
+                            label=f"r/{subreddit} top ({timeframe})",
+                            output_segments=(
+                                "subreddits",
+                                slug_name,
+                                f"top_{_slugify(timeframe)}",
+                            ),
+                            url=f"{BASE_URL}/r/{subreddit}/top/.json",
+                            params={"t": timeframe},
+                            context=subreddit,
+                        )
+                    )
+            else:
+                targets.append(
+                    ListingTarget(
+                        label=f"r/{subreddit} {sort}",
+                        output_segments=("subreddits", slug_name, sort),
+                        url=f"{BASE_URL}/r/{subreddit}/{sort}/.json",
+                        context=subreddit,
+                    )
+                )
+
+    if include_frontpage:
+        targets.append(
+            ListingTarget(
+                label="reddit.com front page",
+                output_segments=("frontpage", "default"),
+                url=f"{BASE_URL}/.json",
+                context="frontpage",
+            )
+        )
+
+    if include_r_all:
+        targets.append(
+            ListingTarget(
+                label="r/all",
+                output_segments=("all", "default"),
+                url=f"{BASE_URL}/r/all/.json",
+                context="all",
+            )
+        )
+
+    allowed_popular_sorts = {"default", "best", "hot", "new", "top", "rising"}
+    _validate_choices(popular_sorts, allowed_popular_sorts, "--popular-sorts")
+    if include_popular:
+        for sort in popular_sorts:
+            if sort == "default":
+                targets.append(
+                    ListingTarget(
+                        label="r/popular (default)",
+                        output_segments=("popular", "default"),
+                        url=f"{BASE_URL}/r/popular/.json",
+                        context="popular",
+                    )
+                )
+            elif sort == "top":
+                _validate_choices(popular_top_times, allowed_time_filters, "--popular-top-times")
+                for timeframe in popular_top_times:
+                    targets.append(
+                        ListingTarget(
+                            label=f"r/popular top ({timeframe})",
+                            output_segments=("popular", "top", _slugify(timeframe)),
+                            url=f"{BASE_URL}/r/popular/top/.json",
+                            params={"t": timeframe},
+                            context="popular",
+                        )
+                    )
+            else:
+                targets.append(
+                    ListingTarget(
+                        label=f"r/popular {sort}",
+                        output_segments=("popular", sort),
+                        url=f"{BASE_URL}/r/popular/{sort}/.json",
+                        context="popular",
+                    )
+                )
+
+    if popular_geo:
+        for geo in popular_geo:
+            code = geo.lower()
+            targets.append(
+                ListingTarget(
+                    label=f"r/popular best (geo={code})",
+                    output_segments=("popular", "best", f"geo_{_slugify(code)}"),
+                    url=f"{BASE_URL}/r/popular/best/.json",
+                    params={"geo_filter": code},
+                    context="popular",
+                )
+            )
+
+    allowed_user_sections = {"overview", "submitted", "comments"}
+    _validate_choices(user_sections, allowed_user_sections, "--user-sections")
+    allowed_user_sorts = {"new", "hot", "top", "best"}
+    _validate_choices(user_sorts, allowed_user_sorts, "--user-sorts")
+    for user in users:
+        slug_user = _slugify(user)
+        for section in user_sections:
+            if section == "overview":
+                path = f"/user/{user}/.json"
+            else:
+                path = f"/user/{user}/{section}/.json"
+            for sort in user_sorts:
+                targets.append(
+                    ListingTarget(
+                        label=f"u/{user} {section} ({sort})",
+                        output_segments=("users", slug_user, section, sort),
+                        url=f"{BASE_URL}{path}",
+                        params={"sort": sort},
+                        context=f"u/{user}",
+                    )
+                )
+
+    for url in listing_urls:
+        targets.append(_target_from_url(url))
+
+    return targets
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -85,6 +285,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Which 'top' timeframe to use (default: day).",
     )
     parser.add_argument(
+        "--subreddit-sorts",
+        default="top",
+        help=(
+            "Comma-separated listing sorts for subreddit targets (choices: default, best, hot, new, rising, top)."
+        ),
+    )
+    parser.add_argument(
+        "--subreddit-top-times",
+        default=None,
+        help=(
+            "Comma-separated time filters for subreddit 'top' listings (choices: hour, day, week, month, year, all)."
+        ),
+    )
+    parser.add_argument(
         "--insecure",
         action="store_true",
         help="Disable TLS certificate verification (only if you trust the network).",
@@ -99,6 +313,65 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=["json", "csv", "both"],
         default="json",
         help="Persist results as JSON files, CSV summaries, or both (default: json).",
+    )
+    parser.add_argument(
+        "--frontpage",
+        action="store_true",
+        help="Include the reddit.com front page (.json) listing in the scrape run.",
+    )
+    parser.add_argument(
+        "--include-r-all",
+        action="store_true",
+        help="Include the r/all listing in the scrape run.",
+    )
+    parser.add_argument(
+        "--popular",
+        action="store_true",
+        help="Include r/popular listings using the sorts configured via --popular-sorts.",
+    )
+    parser.add_argument(
+        "--popular-sorts",
+        default="default,best,hot,new,top,rising",
+        help=(
+            "Comma-separated sorts for r/popular when --popular is provided (choices: default, best, hot, new, top, rising)."
+        ),
+    )
+    parser.add_argument(
+        "--popular-top-times",
+        default=None,
+        help=(
+            "Comma-separated time filters for r/popular 'top' listings (choices: hour, day, week, month, year, all)."
+        ),
+    )
+    parser.add_argument(
+        "--popular-geo",
+        default="",
+        help=(
+            "Comma-separated geo_filter codes for r/popular/best (e.g. us, ar, au)."
+        ),
+    )
+    parser.add_argument(
+        "--user",
+        dest="users",
+        action="append",
+        default=[],
+        help="Reddit username to scrape (overview, submitted, comments). Provide multiple times for multiple users.",
+    )
+    parser.add_argument(
+        "--user-sections",
+        default="overview,submitted,comments",
+        help="Comma-separated user sections to scrape (choices: overview, submitted, comments).",
+    )
+    parser.add_argument(
+        "--user-sorts",
+        default="new,hot,top",
+        help="Comma-separated sorts for user listings (choices: new, hot, top, best).",
+    )
+    parser.add_argument(
+        "--listing-url",
+        action="append",
+        default=[],
+        help="Additional listing JSON URL to scrape. Provide multiple times for multiple endpoints.",
     )
     parser.add_argument(
         "--output-dir",
@@ -136,21 +409,60 @@ def main(argv: Sequence[str] | None = None) -> None:
         output_formats=output_formats,
     )
 
+    subreddit_sorts = _parse_csv(args.subreddit_sorts, default="top")
+    subreddit_top_times = _parse_csv(
+        args.subreddit_top_times, default=args.time_filter
+    )
+    if "top" in subreddit_sorts and not subreddit_top_times:
+        subreddit_top_times = [args.time_filter]
+
+    popular_sorts = _parse_csv(args.popular_sorts)
+    popular_top_times = _parse_csv(args.popular_top_times, default=args.time_filter)
+    if "top" in popular_sorts and not popular_top_times:
+        popular_top_times = [args.time_filter]
+    if "top" not in popular_sorts:
+        popular_top_times = []
+
+    popular_geo = [code for code in _parse_csv(args.popular_geo) if code]
+    user_sections = _parse_csv(args.user_sections)
+    user_sorts = _parse_csv(args.user_sorts)
+
+    targets = _build_targets(
+        subreddits,
+        subreddit_sorts=subreddit_sorts,
+        subreddit_top_times=subreddit_top_times,
+        include_frontpage=args.frontpage,
+        include_r_all=args.include_r_all,
+        include_popular=args.popular,
+        popular_sorts=popular_sorts,
+        popular_top_times=popular_top_times,
+        popular_geo=popular_geo,
+        users=[name.strip() for name in args.users if name and name.strip()],
+        user_sections=user_sections,
+        user_sorts=user_sorts,
+        listing_urls=args.listing_url,
+    )
+
+    if not targets:
+        raise SystemExit(
+            "No listings selected. Provide subreddits, --popular/--frontpage/--include-r-all, --user, or --listing-url."
+        )
+
     if args.rebuild_from_json:
-        for subreddit in subreddits:
+        for target in targets:
             try:
-                rebuild_csv_from_cache(subreddit, options.output_root)
+                rebuild_csv_from_cache(target, options.output_root)
             except Exception as exc:  # noqa: BLE001 - surface error but continue
-                print(f"Failed to rebuild CSV for r/{subreddit}: {exc}", file=sys.stderr)
+                print(f"Failed to rebuild CSV for {target.label}: {exc}", file=sys.stderr)
         return
 
     session = build_session(args.user_agent, not args.insecure)
 
-    for subreddit in subreddits:
+    for target in targets:
         try:
-            process_subreddit(subreddit, session=session, options=options)
+            process_listing(target, session=session, options=options)
         except Exception as exc:  # noqa: BLE001 - keep processing other subreddits
-            print(f"Failed to process r/{subreddit}: {exc}", file=sys.stderr)
+            print(f"Failed to process {target.label}: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

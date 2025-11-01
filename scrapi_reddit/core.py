@@ -49,6 +49,23 @@ class ScrapeOptions:
             raise ValueError(f"Unsupported output formats: {self.output_formats}")
 
 
+@dataclass(slots=True)
+class ListingTarget:
+    """Represents a single listing JSON endpoint to scrape."""
+
+    label: str
+    output_segments: tuple[str, ...]
+    url: str
+    params: dict[str, Any] = field(default_factory=dict)
+    context: str = ""
+    allow_limit: bool = True
+
+    def output_dir(self, root: Path) -> Path:
+        return root.joinpath(*self.output_segments)
+
+    def resolved_context(self) -> str:
+        return self.context or self.label
+
 def build_session(user_agent: str, verify: bool) -> requests.Session:
     session = requests.Session()
     session.headers.update(
@@ -289,14 +306,14 @@ def flatten_comments(post_json: Any, post_context: dict[str, Any]) -> List[dict[
     return records
 
 
-def rebuild_csv_from_cache(subreddit: str, output_root: Path) -> None:
+def rebuild_csv_from_cache(target: ListingTarget, output_root: Path) -> None:
     """Recreate CSV summaries from previously saved JSON artifacts."""
-    base_dir = output_root / subreddit
+    base_dir = target.output_dir(output_root)
     posts_dir = base_dir / "post_jsons"
     links_path = base_dir / "links.json"
     if not posts_dir.exists():
         raise FileNotFoundError(
-            f"No cached post_jsons/ directory for r/{subreddit} (expected {posts_dir})"
+            f"No cached post_jsons/ directory for {target.label} (expected {posts_dir})"
         )
 
     links: list[dict[str, Any]] = []
@@ -351,7 +368,7 @@ def rebuild_csv_from_cache(subreddit: str, output_root: Path) -> None:
             link_info = dict(link_info)
             link_info.setdefault("rank", idx)
 
-        post_record = flatten_post_record(subreddit, link_info, post_data)
+        post_record = flatten_post_record(target.resolved_context(), link_info, post_data)
         posts_records.append(post_record)
         comments_records.extend(
             flatten_comments(
@@ -366,7 +383,7 @@ def rebuild_csv_from_cache(subreddit: str, output_root: Path) -> None:
         )
 
     if not posts_records:
-        print(f"[WARN] No posts reconstructed for r/{subreddit}")
+        print(f"[WARN] No posts reconstructed for {target.label}")
         return
 
     def _rank_key(value: Any) -> float:
@@ -420,29 +437,29 @@ def rebuild_csv_from_cache(subreddit: str, output_root: Path) -> None:
         ],
         comments_csv_path,
     )
-    print(f"Rebuilt CSV summaries for r/{subreddit} at {posts_csv_path} and {comments_csv_path}")
-
-
-def process_subreddit(
-    subreddit: str,
+    print(f"Rebuilt CSV summaries for {target.label} at {posts_csv_path} and {comments_csv_path}")
+def process_listing(
+    target: ListingTarget,
     *,
     session: requests.Session,
     options: ScrapeOptions,
 ) -> None:
-    print(f"\n=== Processing r/{subreddit} ===")
-    base_dir = options.output_root / subreddit
+    print(f"\n=== Processing {target.label} ===")
+    base_dir = target.output_dir(options.output_root)
     posts_path = base_dir / "posts.json"
     links_path = base_dir / "links.json"
     posts_dir = base_dir / "post_jsons"
 
-    listing_url = f"{BASE_URL}/r/{subreddit}/top/.json"
-    listing_params = {"limit": options.listing_limit, "raw_json": 1, "t": options.time_filter}
-    listing_json = fetch_json(session, listing_url, params=listing_params)
+    listing_params = dict(target.params)
+    if target.allow_limit and "limit" not in listing_params:
+        listing_params["limit"] = options.listing_limit
+    listing_params.setdefault("raw_json", 1)
+    listing_json = fetch_json(session, target.url, params=listing_params)
     if "json" in options.output_formats:
         save_json(listing_json, posts_path)
         print(f"Saved listing to {posts_path}")
     else:
-        print(f"Fetched listing for r/{subreddit}")
+        print(f"Fetched listing for {target.label}")
 
     links = extract_links(listing_json)
     if "json" in options.output_formats:
@@ -464,7 +481,7 @@ def process_subreddit(
         params = {"raw_json": 1, "limit": options.comment_limit}
         try:
             post_json = fetch_json(session, post_url, params=params)
-        except Exception as exc:  # noqa: BLE001 - want broad catch to continue scraping
+        except Exception as exc:  # noqa: BLE001 - continue scraping other links
             print(f"[WARN] Skipping post at {post_url} due to error: {exc}", file=sys.stderr)
             time.sleep(options.delay)
             continue
@@ -486,7 +503,7 @@ def process_subreddit(
             print(f"[{progress}] Fetching {post_url}")
 
         if "csv" in options.output_formats:
-            post_record = flatten_post_record(subreddit, link_info, post_data)
+            post_record = flatten_post_record(target.resolved_context(), link_info, post_data)
             posts_records.append(post_record)
             comments_records.extend(
                 flatten_comments(
@@ -551,6 +568,7 @@ def process_subreddit(
 __all__ = [
     "BASE_URL",
     "DEFAULT_USER_AGENT",
+    "ListingTarget",
     "ScrapeOptions",
     "build_session",
     "fetch_json",
@@ -559,7 +577,7 @@ __all__ = [
     "flatten_comments",
     "flatten_post_record",
     "format_timestamp",
-    "process_subreddit",
+    "process_listing",
     "rebuild_csv_from_cache",
     "save_json",
     "shorten_component",
