@@ -9,10 +9,13 @@ import logging
 import re
 import sys
 import time
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from html import unescape
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, List
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
@@ -26,6 +29,57 @@ BASE_URL = "https://www.reddit.com"
 LISTING_PAGE_SIZE = 100
 MAX_COMMENT_LIMIT = 500
 MIN_DELAY_SECONDS = 1.0
+
+MEDIA_EXTENSION_WHITELIST = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".gifv",
+    ".webp",
+    ".bmp",
+    ".tiff",
+    ".mp4",
+    ".webm",
+    ".mov",
+    ".mkv",
+}
+
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".webm",
+    ".mov",
+    ".mkv",
+}
+
+ANIMATED_IMAGE_EXTENSIONS = {
+    ".gif",
+}
+
+STATIC_IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".bmp",
+    ".tiff",
+}
+
+MEDIA_FILTER_CATEGORIES = {"video", "image", "animated", "audio"}
+
+CONTENT_TYPE_EXTENSION_MAP = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/quicktime": ".mov",
+    "video/x-matroska": ".mkv",
+}
 
 
 @dataclass(slots=True)
@@ -41,6 +95,8 @@ class ScrapeOptions:
     listing_page_size: int = LISTING_PAGE_SIZE
     fetch_comments: bool = False
     resume: bool = False
+    download_media: bool = False
+    media_filters: set[str] | None = None
 
     def __post_init__(self) -> None:
         if self.listing_limit is not None:
@@ -62,6 +118,10 @@ class ScrapeOptions:
         if not self.output_formats.issubset(allowed_formats):
             raise ValueError(f"Unsupported output formats: {self.output_formats}")
         self.listing_page_size = max(1, min(int(self.listing_page_size), LISTING_PAGE_SIZE))
+        if self.media_filters is not None and not isinstance(self.media_filters, set):
+            self.media_filters = set(self.media_filters)
+        if self.media_filters:
+            self.media_filters = normalize_media_filter_tokens(self.media_filters)
 
 
 @dataclass(slots=True)
@@ -365,6 +425,376 @@ def _is_rate_limit_error(exc: Exception) -> bool:
         return status == 429
     return False
 
+
+def _clean_media_url(url: Any) -> str | None:
+    if not url:
+        return None
+    candidate = unescape(str(url)).strip()
+    if not candidate:
+        return None
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    return candidate
+
+
+def _normalize_media_candidate(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path or ""
+    lower_path = path.lower()
+
+    if "poster.jpg" in lower_path or lower_path.endswith("thumbnail.jpg"):
+        return None
+    if host.endswith("redgifs.com") and lower_path.endswith(".jpg"):
+        return None
+
+    if lower_path.endswith(".gifv"):
+        stem = Path(path).stem
+        if not stem:
+            return None
+        if host == "imgur.com":
+            return f"https://i.imgur.com/{stem}.mp4"
+        if host.endswith("i.imgur.com"):
+            return url[:-5] + ".mp4"
+        if host.endswith("redditmedia.com"):
+            return url[:-5] + ".mp4"
+        return url[:-5] + ".mp4"
+
+    return url
+
+
+def _extension_priority(ext: str) -> int:
+    ext = ext.lower()
+    if ext in VIDEO_EXTENSIONS:
+        return 3
+    if ext in ANIMATED_IMAGE_EXTENSIONS:
+        return 2
+    if ext in STATIC_IMAGE_EXTENSIONS:
+        return 1
+    return 0
+
+
+def _media_signature(url: str) -> str:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    posix_path = PurePosixPath(parsed.path or "")
+    base = str(posix_path.with_suffix(""))
+    base = base.lower().strip("/")
+    if not base:
+        base = parsed.path.lower().strip("/") or host
+    return f"{host}::{base}"
+
+
+def _classify_media_url(url: str) -> int:
+    ext = _infer_extension_from_url(url)
+    priority = _extension_priority(ext)
+    if priority:
+        return priority
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host.endswith("v.redd.it"):
+        return 3
+    return 1
+
+
+def _derive_reddit_audio_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if not host.endswith("v.redd.it"):
+        return None
+    path = parsed.path or ""
+    if "DASH_audio" in path:
+        return None
+    match = re.search(r"/DASH_[^/]+\.mp4$", path)
+    if not match:
+        return None
+    audio_path = re.sub(r"/DASH_[^/]+\.mp4$", "/DASH_audio.mp4", path)
+    return urlunparse(parsed._replace(path=audio_path))
+
+
+def normalize_media_filter_tokens(filters: Iterable[str] | None) -> set[str] | None:
+    if not filters:
+        return None
+    normalized: set[str] = set()
+    for raw in filters:
+        token = str(raw).strip().lower()
+        if not token:
+            continue
+        if token in MEDIA_FILTER_CATEGORIES:
+            normalized.add(token)
+            continue
+        candidate = token if token.startswith(".") else f".{token}"
+        if candidate in MEDIA_EXTENSION_WHITELIST:
+            normalized.add(candidate)
+            continue
+        raise ValueError(f"Unsupported media filter token: {raw}")
+    return normalized or None
+
+
+def _load_media_manifest(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        logger.warning("Failed to parse media manifest %s: %s", path, exc)
+        return {}
+
+
+def _persist_media_manifest(path: Path, manifest: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _should_download_media(url: str, allowed_filters: set[str] | None) -> bool:
+    if not allowed_filters:
+        return True
+
+    categories: set[str] = set()
+    ext = _infer_extension_from_url(url)
+    parsed = urlparse(url)
+    path_lower = (parsed.path or "").lower()
+    if ext:
+        if ext in VIDEO_EXTENSIONS:
+            categories.add("video")
+        elif ext in ANIMATED_IMAGE_EXTENSIONS:
+            categories.add("animated")
+        elif ext in STATIC_IMAGE_EXTENSIONS:
+            categories.add("image")
+    else:
+        classification = _classify_media_url(url)
+        if classification == 3:
+            categories.add("video")
+            ext = ".mp4"
+        elif classification == 2:
+            categories.add("animated")
+            ext = ".gif"
+        else:
+            categories.add("image")
+            ext = ".jpg"
+
+    if "dash_audio" in path_lower:
+        categories.add("audio")
+        categories.discard("video")
+
+    if ext and ext in allowed_filters:
+        return True
+    for category in categories:
+        if category in allowed_filters:
+            return True
+    return False
+
+
+def _infer_extension_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    ext = Path(parsed.path).suffix.lower()
+    if ext in MEDIA_EXTENSION_WHITELIST:
+        if ext == ".gifv":
+            return ".mp4"
+        return ext
+    return ""
+
+
+def _infer_extension_from_content_type(content_type: str | None) -> str:
+    if not content_type:
+        return ""
+    content_type = content_type.split(";", 1)[0].lower()
+    return CONTENT_TYPE_EXTENSION_MAP.get(content_type, "")
+
+
+def _is_probable_media_url(url: str) -> bool:
+    ext = _infer_extension_from_url(url)
+    if ext:
+        return True
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    # Known media hosts without obvious extensions
+    if host.endswith("v.redd.it") or host.endswith("i.redd.it"):
+        return True
+    if host.endswith("imgur.com") and parsed.path:
+        return True
+    return False
+
+
+def _collect_media_urls(
+    link_info: dict[str, Any],
+    child_data: dict[str, Any] | None,
+    post_data: dict[str, Any] | None,
+) -> list[str]:
+    candidates: dict[str, tuple[int, int, str]] = {}
+    order_counter = 0
+
+    def add(raw_url: Any) -> None:
+        nonlocal order_counter
+        cleaned = _clean_media_url(raw_url)
+        if not cleaned:
+            return
+        normalized = _normalize_media_candidate(cleaned)
+        if not normalized:
+            return
+        if not _is_probable_media_url(normalized):
+            return
+        priority = _classify_media_url(normalized)
+        signature = _media_signature(normalized)
+        existing = candidates.get(signature)
+        if existing is None:
+            candidates[signature] = (priority, order_counter, normalized)
+        else:
+            current_priority, existing_order, existing_url = existing
+            if priority > current_priority:
+                candidates[signature] = (priority, existing_order, normalized)
+        order_counter += 1
+
+    def add_from_preview(preview: dict[str, Any] | None) -> None:
+        if not isinstance(preview, dict):
+            return
+        for image in preview.get("images", []) or []:
+            variants = image.get("variants", {}) or {}
+            mp4_variant = variants.get("mp4")
+            if isinstance(mp4_variant, dict):
+                add(mp4_variant.get("source", {}).get("url"))
+                continue
+            gif_variant = variants.get("gif")
+            if isinstance(gif_variant, dict):
+                add(gif_variant.get("source", {}).get("url"))
+                continue
+            add(image.get("source", {}).get("url"))
+
+    def add_from_media_metadata(metadata: dict[str, Any] | None, gallery_order: list[Any] | None) -> None:
+        if not isinstance(metadata, dict):
+            return
+        ids: Iterable[str]
+        if gallery_order:
+            ids = [str(item.get("media_id")) for item in gallery_order if isinstance(item, dict)]
+        else:
+            ids = metadata.keys()
+        for media_id in ids:
+            media_entry = metadata.get(media_id)
+            if not isinstance(media_entry, dict):
+                continue
+            source = media_entry.get("s") or {}
+            add(source.get("mp4"))
+            add(source.get("gif"))
+            add(source.get("u"))
+            gif_direct = media_entry.get("gif")
+            if isinstance(gif_direct, str):
+                add(gif_direct)
+
+    def process_data(data: dict[str, Any] | None) -> None:
+        if not isinstance(data, dict):
+            return
+        add(data.get("url_overridden_by_dest"))
+        add(data.get("url"))
+        secure_media = data.get("secure_media") or data.get("media") or {}
+        if isinstance(secure_media, dict):
+            reddit_video = secure_media.get("reddit_video")
+            if isinstance(reddit_video, dict):
+                fallback_url = reddit_video.get("fallback_url")
+                add(fallback_url)
+                audio_url = _derive_reddit_audio_url(fallback_url) if fallback_url else None
+                if audio_url:
+                    add(audio_url)
+        add_from_preview(data.get("preview"))
+        gallery_data = data.get("gallery_data", {}).get("items") if isinstance(data.get("gallery_data"), dict) else None
+        add_from_media_metadata(data.get("media_metadata"), gallery_data)
+
+    process_data(child_data)
+    process_data(post_data)
+    add(link_info.get("content_url"))
+
+    ordered = sorted(candidates.values(), key=lambda item: item[1])
+    return [entry[2] for entry in ordered]
+
+
+def _download_single_media(
+    session: requests.Session,
+    url: str,
+    dest_dir: Path,
+    base_name: str,
+    *,
+    resume: bool,
+    ext_hint: str,
+) -> Path | None:
+    try:
+        with closing(session.get(url, stream=True, timeout=60)) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type") if hasattr(response, "headers") else None
+            content_ext = _infer_extension_from_content_type(content_type)
+            ext = ext_hint or ""
+            if content_ext:
+                if not ext:
+                    ext = content_ext
+                else:
+                    if _extension_priority(content_ext) > _extension_priority(ext):
+                        ext = content_ext
+            if not ext:
+                ext = ".bin"
+            dest_path = dest_dir / f"{base_name}{ext}"
+            if resume and dest_path.exists():
+                logger.info("Media already exists, skipping %s", dest_path)
+                return dest_path
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            with dest_path.open("wb") as fh:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        fh.write(chunk)
+            return dest_path
+    except requests.exceptions.RequestException as exc:  # pragma: no cover - network errors
+        logger.warning("Failed to download media %s: %s", url, exc)
+    except Exception as exc:  # pragma: no cover - IO errors
+        logger.warning("Failed to write media %s: %s", url, exc)
+    return None
+
+
+def _download_media_items(
+    session: requests.Session,
+    urls: list[str],
+    *,
+    media_dir: Path,
+    base_name: str,
+    downloaded_urls: set[str],
+    resume: bool,
+    manifest: dict[str, str] | None = None,
+    manifest_path: Path | None = None,
+    allowed_filters: set[str] | None = None,
+) -> int:
+    if not urls:
+        return 0
+    if manifest is None:
+        manifest = {}
+    saved = 0
+    updated_manifest = False
+    total = len(urls)
+    for index, media_url in enumerate(urls, start=1):
+        if media_url in downloaded_urls or media_url in manifest:
+            downloaded_urls.add(media_url)
+            continue
+        if allowed_filters and not _should_download_media(media_url, allowed_filters):
+            continue
+        downloaded_urls.add(media_url)
+        ext_hint = _infer_extension_from_url(media_url)
+        suffix = f"_media{index:02d}" if total > 1 else "_media"
+        candidate_name = shorten_component(f"{base_name}{suffix}", 140)
+        result = _download_single_media(
+            session,
+            media_url,
+            media_dir,
+            candidate_name,
+            resume=resume,
+            ext_hint=ext_hint,
+        )
+        if result is not None:
+            saved += 1
+            try:
+                relative_path = str(result.relative_to(media_dir))
+            except ValueError:
+                relative_path = result.name
+            manifest[media_url] = relative_path
+            updated_manifest = True
+    if updated_manifest and manifest_path is not None:
+        _persist_media_manifest(manifest_path, manifest)
+    return saved
 
 def derive_filename(link_info: dict[str, Any], post_data: dict[str, Any] | None) -> str:
     rank = link_info.get("rank")
@@ -688,6 +1118,14 @@ def process_listing(
     posts_path = base_dir / "posts.json"
     links_path = base_dir / "links.json"
     posts_dir = base_dir / "post_jsons"
+    media_dir = base_dir / "media"
+    media_manifest_path = base_dir / "media_manifest.json"
+    media_manifest: dict[str, str] = {}
+    downloaded_media_urls: set[str] = set()
+    if options.download_media:
+        if options.resume:
+            media_manifest = _load_media_manifest(media_manifest_path)
+        downloaded_media_urls = set(media_manifest.keys())
 
     listing_json, children, pages = _fetch_listing(session, target, options)
     if "json" in options.output_formats:
@@ -706,6 +1144,17 @@ def process_listing(
             pages,
         )
 
+    child_lookup: dict[str, dict[str, Any]] = {}
+    for child in children:
+        if not isinstance(child, dict):
+            continue
+        data = child.get("data")
+        if not isinstance(data, dict):
+            continue
+        post_id = str(data.get("id") or "").strip()
+        if post_id:
+            child_lookup[post_id] = data
+
     links = extract_links(listing_json)
     if options.listing_limit is not None:
         links = links[: options.listing_limit]
@@ -722,12 +1171,28 @@ def process_listing(
     reused_count = 0
     skipped_count = 0
     rate_limit_events = 0
+    media_saved = 0
 
     for link_info in links:
         if not options.fetch_comments:
             if "csv" in options.output_formats:
                 post_record = flatten_post_record(target.resolved_context(), link_info, None)
                 posts_records.append(post_record)
+            if options.download_media:
+                post_id = str(link_info.get("id") or "")
+                child_data = child_lookup.get(post_id, {})
+                media_urls = _collect_media_urls(link_info, child_data, None)
+                media_saved += _download_media_items(
+                    session,
+                    media_urls,
+                    media_dir=media_dir,
+                    base_name=shorten_component(f"{link_info.get('id') or 'post'}", 120),
+                    downloaded_urls=downloaded_media_urls,
+                    resume=options.resume,
+                    manifest=media_manifest,
+                    manifest_path=media_manifest_path,
+                    allowed_filters=options.media_filters,
+                )
             continue
 
         post_url = link_info.get("url")
@@ -796,7 +1261,13 @@ def process_listing(
 
         post_data = post_data or _extract_post_data(post_json) or {}
 
-        target_path = cached_path or (posts_dir / derive_filename(link_info, post_data))
+        if cached_path:
+            target_path = cached_path
+            base_name = Path(cached_path).stem
+        else:
+            derived_filename = derive_filename(link_info, post_data)
+            target_path = posts_dir / derived_filename
+            base_name = Path(derived_filename).stem
 
         if "json" in options.output_formats:
             if reused and cached_path:
@@ -829,6 +1300,22 @@ def process_listing(
         if attempted_fetch and fetched_successfully:
             fetched_count += 1
             time.sleep(options.delay)
+
+        if options.download_media:
+            post_id = str(link_info.get("id") or "")
+            child_data = child_lookup.get(post_id, {})
+            media_urls = _collect_media_urls(link_info, child_data, post_data)
+            media_saved += _download_media_items(
+                session,
+                media_urls,
+                media_dir=media_dir,
+                base_name=base_name,
+                downloaded_urls=downloaded_media_urls,
+                resume=options.resume,
+                manifest=media_manifest,
+                manifest_path=media_manifest_path,
+                allowed_filters=options.media_filters,
+            )
 
     if "csv" in options.output_formats:
         posts_csv_path = base_dir / "posts.csv"
@@ -884,7 +1371,7 @@ def process_listing(
             logger.info("Wrote CSV summary to %s", posts_csv_path)
 
     logger.info(
-        "Completed %s: total=%d fetched=%d reused=%d skipped=%d rate-limit-waits=%d comments=%d",
+        "Completed %s: total=%d fetched=%d reused=%d skipped=%d rate-limit-waits=%d comments=%d media=%d",
         target.label,
         total_links,
         fetched_count,
@@ -892,6 +1379,7 @@ def process_listing(
         skipped_count,
         rate_limit_events,
         len(comments_records),
+        media_saved,
     )
 
 
@@ -905,6 +1393,13 @@ def process_post(
     base_dir = target.output_dir(options.output_root)
     posts_dir = base_dir / "post_jsons"
     links_path = base_dir / "links.json"
+    media_dir = base_dir / "media"
+    media_manifest_path = base_dir / "media_manifest.json"
+    media_manifest: dict[str, str] = {}
+    downloaded_media_urls: set[str] = set()
+    if options.download_media and options.resume:
+        media_manifest = _load_media_manifest(media_manifest_path)
+        downloaded_media_urls = set(media_manifest.keys())
 
     params = {"raw_json": 1, "limit": options.comment_limit}
     params.update(target.params)
@@ -934,8 +1429,10 @@ def process_post(
     }
     links = [link_info]
 
+    filename = derive_filename(link_info, post_data)
+    base_name = Path(filename).stem
+
     if "json" in options.output_formats:
-        filename = derive_filename(link_info, post_data)
         target_path = posts_dir / filename
         logger.info("Saving post JSON to %s", target_path)
         save_json(post_json, target_path)
@@ -1004,6 +1501,29 @@ def process_post(
             base_dir,
             len(comments_records),
         )
+
+    media_saved = 0
+    if options.download_media:
+        media_urls = _collect_media_urls(link_info, post_data, post_data)
+        media_saved = _download_media_items(
+            session,
+            media_urls,
+            media_dir=media_dir,
+            base_name=base_name,
+            downloaded_urls=downloaded_media_urls,
+            resume=options.resume,
+            manifest=media_manifest,
+            manifest_path=media_manifest_path,
+            allowed_filters=options.media_filters,
+        )
+        logger.info("Downloaded %d media file(s) for %s", media_saved, target.label)
+
+    logger.info(
+        "Completed %s (comments=%d, media=%d)",
+        target.label,
+        len(comments_records),
+        media_saved,
+    )
 __all__ = [
     "BASE_URL",
     "DEFAULT_USER_AGENT",
@@ -1019,6 +1539,7 @@ __all__ = [
     "format_timestamp",
     "process_listing",
     "process_post",
+    "normalize_media_filter_tokens",
     "rebuild_csv_from_cache",
     "save_json",
     "shorten_component",

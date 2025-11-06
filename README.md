@@ -7,6 +7,8 @@ Scrapi Reddit is a zero-auth toolkit for scraping public Reddit listings. Use th
 - Toggle comment collection per post with resumable runs that reuse cached JSON and persist to CSV.
 - Target individual posts to download full comment trees on demand.
 - Automatic pagination, exponential backoff for rate limits, and structured logging with adjustable verbosity.
+- Optional media capture downloads linked images, GIFs, and videos alongside post metadata.
+- Media filters let you keep only the assets you need (e.g., videos only or static images only).
 - Save outputs as JSON and optionally flatten posts/comments into CSV for downstream analysis.
 - Configurable CLI plus Python API for scripting and integration.
 
@@ -34,7 +36,9 @@ This command downloads up to 200 posts from r/python, fetches comments (up to 50
 ### Common CLI Options
 - `--fetch-comments` Enable post-level comment requests (defaults off).
 - `--comment-limit 0` Request the maximum 500 comments per post.
-- `--continue` Resume a previous run by reusing cached post JSON files.
+- `--continue` Resume a previous run by reusing cached post JSON files and skipping previously downloaded media.
+- `--media-filter video,gif` Restrict downloads to specific categories or extensions (`video`, `image`, `animated`, `audio`, or extensions such as `mp4`, `jpg`, `gif`).
+- `--download-media` Save linked images/GIFs/videos under each target's media directory.
 - `--popular --popular-geo <region-code>` Pull popular listings with geo filters.
 - `--user <name>` Scrape user overview/submitted/comments sections.
 
@@ -75,7 +79,9 @@ options = ScrapeOptions(
     time_filter="day",
     output_formats={"json", "csv"},
     fetch_comments=True,
-    resume=True,
+    resume=True,          # reuse cached JSON/media on reruns
+    download_media=True,
+    media_filters={"video", ".mp4"},
 )
 ```
 
@@ -107,6 +113,7 @@ post_target = PostTarget(
 process_post(post_target, session=session, options=options)
 ```
 Both helpers write JSON/CSV to the configured output directory and emit progress via logging.
+When `download_media=True` (or `--download-media` on the CLI) any discoverable images, GIFs, and videos are saved under a `media/` directory per target. Reddit hosts video and audio streams separately, so clips from `v.redd.it` arrive as two files (for example `*_media01.mp4` and `*_media01_audio.mp4`). Merge them with a tool like `ffmpeg -i video.mp4 -i video_audio.mp4 -c copy merged.mp4` if you need the original audio track inline.
 
 ## Testing
 ```bash

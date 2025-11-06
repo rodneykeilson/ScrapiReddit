@@ -21,6 +21,7 @@ from .core import (
     process_post,
     rebuild_csv_from_cache,
     shorten_component,
+    normalize_media_filter_tokens,
 )
 
 
@@ -333,6 +334,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Fetch comments for listing posts (default: disabled to reduce API calls).",
     )
     parser.add_argument(
+        "--download-media",
+        action="store_true",
+        help="Download linked images, GIFs, and videos for each scraped post.",
+    )
+    parser.add_argument(
+        "--media-filter",
+        default=None,
+        help=(
+            "Comma-separated list of media categories or extensions to download when --download-media is set. "
+            "Supported categories: video, image, animated, audio; extensions: mp4, webm, gif, jpg, png, etc."
+        ),
+    )
+    parser.add_argument(
         "--continue",
         dest="resume",
         action="store_true",
@@ -500,6 +514,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     output_root = Path(args.output_dir).expanduser().resolve() if args.output_dir else _default_output_root()
     output_root.mkdir(parents=True, exist_ok=True)
 
+    try:
+        media_filters = normalize_media_filter_tokens(
+            _parse_csv(args.media_filter) if args.media_filter else None
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     options = ScrapeOptions(
         output_root=output_root,
         listing_limit=args.limit,
@@ -509,6 +530,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         output_formats=output_formats,
         fetch_comments=args.fetch_comments,
         resume=args.resume,
+        download_media=args.download_media,
+        media_filters=media_filters,
     )
 
     subreddit_sorts = _parse_csv(args.subreddit_sorts, default="top")

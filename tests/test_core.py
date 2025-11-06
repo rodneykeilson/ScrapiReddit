@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+import requests
+
 import scrapi_reddit.core as core
 from scrapi_reddit.core import (
     BASE_URL,
@@ -11,6 +15,7 @@ from scrapi_reddit.core import (
     derive_filename,
     extract_links,
     rebuild_csv_from_cache,
+    normalize_media_filter_tokens,
 )
 
 
@@ -338,3 +343,251 @@ def test_process_listing_rate_limit_retries(tmp_path: Path, monkeypatch) -> None
 
     # First rate limit should wait 60s, second should wait 120s before succeeding
     assert sleeps[:2] == [60, 120]
+
+
+def test_collect_media_urls_pulls_multiple_sources() -> None:
+    link_info = {
+        "content_url": "https://www.reddit.com/r/example/comments/abc123/post/.json",
+    }
+    child_data = {
+        "url_overridden_by_dest": "https://i.redd.it/example.png",
+        "preview": {
+            "images": [
+                {
+                    "source": {"url": "https://preview.redd.it/image.jpg"},
+                    "variants": {
+                        "gif": {"source": {"url": "https://preview.redd.it/image.gif"}},
+                        "mp4": {"source": {"url": "https://preview.redd.it/image.mp4"}},
+                    },
+                }
+            ]
+        },
+        "media_metadata": {
+            "abc": {
+                "s": {"u": "https://i.redd.it/gallery1.jpg"},
+            }
+        },
+        "gallery_data": {
+            "items": [
+                {"media_id": "abc"},
+            ]
+        },
+    }
+    post_data = {
+        "secure_media": {
+            "reddit_video": {
+                "fallback_url": "https://v.redd.it/video.mp4",
+            }
+        }
+    }
+
+    urls = core._collect_media_urls(link_info, child_data, post_data)
+
+    assert "https://i.redd.it/example.png" in urls
+    assert len(urls) == 4
+    assert "https://i.redd.it/example.png" in urls
+    assert "https://preview.redd.it/image.mp4" in urls
+    assert "https://i.redd.it/gallery1.jpg" in urls
+    assert "https://v.redd.it/video.mp4" in urls
+    assert all("poster.jpg" not in url for url in urls)
+
+
+def test_download_media_items_saves_files(tmp_path: Path) -> None:
+    class FakeResponse:
+        def __init__(self, *, headers: dict[str, str], payload: bytes, status_code: int = 200) -> None:
+            self.headers = headers
+            self._payload = payload
+            self.status_code = status_code
+            self.closed = False
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise requests.exceptions.HTTPError(str(self.status_code))
+
+        def iter_content(self, chunk_size: int = 8192):  # noqa: D401 - generator helper
+            yield self._payload
+
+        def close(self) -> None:  # pragma: no cover - defensive
+            self.closed = True
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get(self, url: str, *, stream: bool, timeout: int):  # noqa: D401 - signature matches requests
+            self.calls.append(url)
+            if url.endswith("example.png"):
+                return FakeResponse(headers={"Content-Type": "image/png"}, payload=b"png-bytes")
+            return FakeResponse(headers={"Content-Type": "video/mp4"}, payload=b"mp4-bytes")
+
+    session = FakeSession()
+    urls = [
+        "https://i.redd.it/example.png",
+        "https://v.redd.it/example",
+    ]
+
+    saved = core._download_media_items(
+        session,
+        urls,
+        media_dir=tmp_path,
+        base_name="post",
+        downloaded_urls=set(),
+        resume=False,
+    )
+
+    assert saved == 2
+    saved_files = sorted(p.name for p in tmp_path.iterdir())
+    assert saved_files[0].startswith("post_media01")
+    assert saved_files[1].startswith("post_media02")
+    assert session.calls == urls
+
+
+def test_collect_media_urls_skips_poster_thumbnails() -> None:
+    link_info = {"content_url": "https://media.redgifs.com/example-poster.jpg"}
+    urls = core._collect_media_urls(link_info, None, None)
+
+    assert urls == []
+
+
+def test_collect_media_urls_converts_gifv_to_mp4() -> None:
+    gifv_url = "https://i.imgur.com/Example.gifv"
+    link_info = {"content_url": gifv_url}
+    child_data = {"url": gifv_url}
+
+    urls = core._collect_media_urls(link_info, child_data, None)
+
+    assert urls == ["https://i.imgur.com/Example.mp4"]
+
+
+def test_collect_media_urls_prefers_video_over_duplicate_gif() -> None:
+    link_info = {"content_url": "https://i.imgur.com/demo.gif"}
+    child_data = {
+        "url_overridden_by_dest": "https://i.imgur.com/demo.gifv",
+        "preview": {
+            "images": [
+                {
+                    "variants": {
+                        "mp4": {"source": {"url": "https://i.imgur.com/demo.mp4"}},
+                        "gif": {"source": {"url": "https://i.imgur.com/demo.gif"}},
+                    }
+                }
+            ]
+        },
+    }
+
+    urls = core._collect_media_urls(link_info, child_data, None)
+
+    assert urls == ["https://i.imgur.com/demo.mp4"]
+
+
+def test_collect_media_urls_adds_reddit_audio_track() -> None:
+    fallback = "https://v.redd.it/example/DASH_720.mp4?source=fallback"
+    link_info = {"content_url": fallback}
+    child_data = {
+        "secure_media": {
+            "reddit_video": {
+                "fallback_url": fallback,
+            }
+        }
+    }
+
+    urls = core._collect_media_urls(link_info, child_data, None)
+
+    assert fallback in urls
+    audio_url = core._derive_reddit_audio_url(fallback)
+    assert audio_url in urls
+
+
+def test_normalize_media_filter_tokens_accepts_categories_and_extensions() -> None:
+    tokens = normalize_media_filter_tokens(["video", "mp4", "gif"])
+    assert tokens == {"video", ".mp4", ".gif"}
+
+
+def test_normalize_media_filter_tokens_rejects_unknown() -> None:
+    with pytest.raises(ValueError):
+        normalize_media_filter_tokens(["unknown"])
+
+
+def test_download_media_items_respects_manifest_on_resume(tmp_path: Path) -> None:
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get(self, url: str, *, stream: bool, timeout: int):  # noqa: D401 - signature compatibility
+            self.calls.append(url)
+            raise AssertionError("Download should be skipped when manifest already records URL")
+
+    manifest_path = tmp_path / "media_manifest.json"
+    manifest = {"https://i.redd.it/example.png": "post_media01.png"}
+
+    saved = core._download_media_items(
+        FakeSession(),
+        ["https://i.redd.it/example.png"],
+        media_dir=tmp_path,
+        base_name="post",
+        downloaded_urls=set(),
+        resume=True,
+        manifest=manifest,
+        manifest_path=manifest_path,
+    )
+
+    assert saved == 0
+    assert not manifest_path.exists()
+
+
+def test_download_media_items_applies_filters(tmp_path: Path) -> None:
+    class FakeResponse:
+        def __init__(self, *, headers: dict[str, str], payload: bytes) -> None:
+            self.headers = headers
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_content(self, chunk_size: int = 8192):  # noqa: D401
+            yield self._payload
+
+        def close(self) -> None:  # pragma: no cover - interface compliance
+            return None
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get(self, url: str, *, stream: bool, timeout: int):  # noqa: D401
+            self.calls.append(url)
+            if url.endswith(".mp4"):
+                return FakeResponse(headers={"Content-Type": "video/mp4"}, payload=b"mp4")
+            if url.endswith(".jpg"):
+                return FakeResponse(headers={"Content-Type": "image/jpeg"}, payload=b"jpg")
+            raise AssertionError(f"Unexpected URL {url}")
+
+    session = FakeSession()
+    urls = [
+        "https://i.redd.it/example.mp4",
+        "https://i.redd.it/example.jpg",
+    ]
+
+    saved = core._download_media_items(
+        session,
+        urls,
+        media_dir=tmp_path,
+        base_name="post",
+        downloaded_urls=set(),
+        resume=False,
+        allowed_filters={".mp4"},
+    )
+
+    assert saved == 1
+    assert session.calls == ["https://i.redd.it/example.mp4"]
+    files = list(tmp_path.iterdir())
+    assert len(files) == 1
+    assert files[0].suffix == ".mp4"
+
+
+def test_should_download_media_recognizes_audio_category() -> None:
+    audio_url = "https://v.redd.it/example/DASH_audio.mp4"
+    video_url = "https://v.redd.it/example/DASH_720.mp4"
+
+    assert core._should_download_media(audio_url, {"audio"})
+    assert not core._should_download_media(video_url, {"audio"})
