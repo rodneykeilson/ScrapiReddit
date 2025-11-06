@@ -11,7 +11,7 @@ import sys
 import time
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from html import unescape
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, List
@@ -65,7 +65,7 @@ STATIC_IMAGE_EXTENSIONS = {
     ".tiff",
 }
 
-MEDIA_FILTER_CATEGORIES = {"video", "image", "animated", "audio"}
+MEDIA_FILTER_CATEGORIES = {"video", "image", "animated"}
 
 CONTENT_TYPE_EXTENSION_MAP = {
     "image/jpeg": ".jpg",
@@ -496,23 +496,6 @@ def _classify_media_url(url: str) -> int:
     if host.endswith("v.redd.it"):
         return 3
     return 1
-
-
-def _derive_reddit_audio_url(url: str) -> str | None:
-    parsed = urlparse(url)
-    host = parsed.netloc.lower()
-    if not host.endswith("v.redd.it"):
-        return None
-    path = parsed.path or ""
-    if "DASH_audio" in path:
-        return None
-    match = re.search(r"/DASH_[^/]+\.mp4$", path)
-    if not match:
-        return None
-    audio_path = re.sub(r"/DASH_[^/]+\.mp4$", "/DASH_audio.mp4", path)
-    return urlunparse(parsed._replace(path=audio_path))
-
-
 def normalize_media_filter_tokens(filters: Iterable[str] | None) -> set[str] | None:
     if not filters:
         return None
@@ -574,10 +557,6 @@ def _should_download_media(url: str, allowed_filters: set[str] | None) -> bool:
             categories.add("image")
             ext = ".jpg"
 
-    if "dash_audio" in path_lower:
-        categories.add("audio")
-        categories.discard("video")
-
     if ext and ext in allowed_filters:
         return True
     for category in categories:
@@ -586,6 +565,40 @@ def _should_download_media(url: str, allowed_filters: set[str] | None) -> bool:
     return False
 
 
+def _categorize_media_label(ext: str, url: str) -> str:
+    ext = ext.lower()
+    if ext in {".mp4", ".mov", ".mkv"}:
+        return "mp4"
+    if ext == ".webm":
+        return "webm"
+    if ext == ".gif":
+        return "gif"
+    if ext in {".jpg", ".jpeg"}:
+        return "jpg"
+    if ext == ".png":
+        return "png"
+    if ext == ".webp":
+        return "webp"
+    return ext[1:] if ext.startswith(".") and ext[1:] else "other"
+
+
+def _relocate_media_file(
+    source_path: Path,
+    *,
+    media_dir: Path,
+    scope: str,
+    format_label: str,
+) -> Path:
+    target_dir = media_dir / scope / format_label
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / source_path.name
+    if source_path.resolve() == target_path.resolve():
+        return target_path
+    if target_path.exists():
+        source_path.unlink(missing_ok=True)
+        return target_path
+    source_path.replace(target_path)
+    return target_path
 def _infer_extension_from_url(url: str) -> str:
     parsed = urlparse(url)
     ext = Path(parsed.path).suffix.lower()
@@ -692,9 +705,6 @@ def _collect_media_urls(
             if isinstance(reddit_video, dict):
                 fallback_url = reddit_video.get("fallback_url")
                 add(fallback_url)
-                audio_url = _derive_reddit_audio_url(fallback_url) if fallback_url else None
-                if audio_url:
-                    add(audio_url)
         add_from_preview(data.get("preview"))
         gallery_data = data.get("gallery_data", {}).get("items") if isinstance(data.get("gallery_data"), dict) else None
         add_from_media_metadata(data.get("media_metadata"), gallery_data)
@@ -715,7 +725,7 @@ def _download_single_media(
     *,
     resume: bool,
     ext_hint: str,
-) -> Path | None:
+) -> tuple[Path | None, str]:
     try:
         with closing(session.get(url, stream=True, timeout=60)) as response:
             response.raise_for_status()
@@ -733,18 +743,18 @@ def _download_single_media(
             dest_path = dest_dir / f"{base_name}{ext}"
             if resume and dest_path.exists():
                 logger.info("Media already exists, skipping %s", dest_path)
-                return dest_path
+                return dest_path, ext
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             with dest_path.open("wb") as fh:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         fh.write(chunk)
-            return dest_path
+            return dest_path, ext
     except requests.exceptions.RequestException as exc:  # pragma: no cover - network errors
         logger.warning("Failed to download media %s: %s", url, exc)
     except Exception as exc:  # pragma: no cover - IO errors
         logger.warning("Failed to write media %s: %s", url, exc)
-    return None
+    return None, ""
 
 
 def _download_media_items(
@@ -758,6 +768,7 @@ def _download_media_items(
     manifest: dict[str, str] | None = None,
     manifest_path: Path | None = None,
     allowed_filters: set[str] | None = None,
+    scope: str,
 ) -> int:
     if not urls:
         return 0
@@ -776,7 +787,7 @@ def _download_media_items(
         ext_hint = _infer_extension_from_url(media_url)
         suffix = f"_media{index:02d}" if total > 1 else "_media"
         candidate_name = shorten_component(f"{base_name}{suffix}", 140)
-        result = _download_single_media(
+        temp_path, final_ext = _download_single_media(
             session,
             media_url,
             media_dir,
@@ -784,12 +795,20 @@ def _download_media_items(
             resume=resume,
             ext_hint=ext_hint,
         )
-        if result is not None:
+        if temp_path is not None:
             saved += 1
+            effective_ext = final_ext or ext_hint or Path(temp_path.name).suffix
+            format_label = _categorize_media_label(effective_ext, media_url)
+            relocated = _relocate_media_file(
+                temp_path,
+                media_dir=media_dir,
+                scope=scope,
+                format_label=format_label,
+            )
             try:
-                relative_path = str(result.relative_to(media_dir))
+                relative_path = str(relocated.relative_to(media_dir))
             except ValueError:
-                relative_path = result.name
+                relative_path = relocated.name
             manifest[media_url] = relative_path
             updated_manifest = True
     if updated_manifest and manifest_path is not None:
@@ -810,7 +829,7 @@ def derive_filename(link_info: dict[str, Any], post_data: dict[str, Any] | None)
     date_fragment = ""
     if created_ts:
         try:
-            date_fragment = datetime.utcfromtimestamp(float(created_ts)).strftime("%Y%m%d")
+            date_fragment = datetime.fromtimestamp(float(created_ts), timezone.utc).strftime("%Y%m%d")
         except (ValueError, TypeError, OverflowError):
             date_fragment = ""
 
@@ -849,7 +868,7 @@ def write_csv(rows: List[dict[str, Any]], fieldnames: List[str], path: Path) -> 
 
 def format_timestamp(epoch: Any) -> str:
     try:
-        return datetime.utcfromtimestamp(float(epoch)).isoformat()
+        return datetime.fromtimestamp(float(epoch), timezone.utc).isoformat()
     except (TypeError, ValueError, OverflowError):
         return ""
 
@@ -1025,25 +1044,27 @@ def rebuild_csv_from_cache(target: ListingTarget, output_root: Path) -> None:
                 "created_utc": post_data.get("created_utc"),
                 "permalink": post_data.get("permalink"),
                 "url": post_data.get("permalink"),
+                "post_url": post_data.get("permalink"),
+                "content_url": post_data.get("url"),
             }
-        else:
-            link_info = dict(link_info)
-            link_info.setdefault("rank", idx)
-
-        post_record = flatten_post_record(target.resolved_context(), link_info, post_data)
+        post_record = flatten_post_record(
+            target.context or link_info.get("subreddit") or target.label,
+            link_info,
+            post_data,
+        )
         posts_records.append(post_record)
+
         comments_records.extend(
             flatten_comments(
                 post_json,
                 {
                     "post_id": post_record.get("post_id"),
-                    "rank": post_record.get("rank"),
-                    "title": post_record.get("title"),
+                    "post_rank": post_record.get("rank"),
+                    "post_title": post_record.get("title"),
                     "subreddit": post_record.get("subreddit"),
                 },
             )
         )
-
     if not posts_records:
         logger.warning("No posts reconstructed for %s", target.label)
         return
@@ -1192,6 +1213,7 @@ def process_listing(
                     manifest=media_manifest,
                     manifest_path=media_manifest_path,
                     allowed_filters=options.media_filters,
+                    scope="posts",
                 )
             continue
 
@@ -1315,6 +1337,7 @@ def process_listing(
                 manifest=media_manifest,
                 manifest_path=media_manifest_path,
                 allowed_filters=options.media_filters,
+                scope="posts",
             )
 
     if "csv" in options.output_formats:
@@ -1515,6 +1538,7 @@ def process_post(
             manifest=media_manifest,
             manifest_path=media_manifest_path,
             allowed_filters=options.media_filters,
+            scope="posts",
         )
         logger.info("Downloaded %d media file(s) for %s", media_saved, target.label)
 

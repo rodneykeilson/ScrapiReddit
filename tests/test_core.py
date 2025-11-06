@@ -433,12 +433,16 @@ def test_download_media_items_saves_files(tmp_path: Path) -> None:
         base_name="post",
         downloaded_urls=set(),
         resume=False,
+        scope="posts",
     )
 
     assert saved == 2
-    saved_files = sorted(p.name for p in tmp_path.iterdir())
-    assert saved_files[0].startswith("post_media01")
-    assert saved_files[1].startswith("post_media02")
+    png_files = list((tmp_path / "posts" / "png").glob("*.png"))
+    mp4_files = list((tmp_path / "posts" / "mp4").glob("*.mp4"))
+    assert len(png_files) == 1
+    assert len(mp4_files) == 1
+    assert png_files[0].name.startswith("post_media01")
+    assert mp4_files[0].name.startswith("post_media02")
     assert session.calls == urls
 
 
@@ -480,24 +484,6 @@ def test_collect_media_urls_prefers_video_over_duplicate_gif() -> None:
     assert urls == ["https://i.imgur.com/demo.mp4"]
 
 
-def test_collect_media_urls_adds_reddit_audio_track() -> None:
-    fallback = "https://v.redd.it/example/DASH_720.mp4?source=fallback"
-    link_info = {"content_url": fallback}
-    child_data = {
-        "secure_media": {
-            "reddit_video": {
-                "fallback_url": fallback,
-            }
-        }
-    }
-
-    urls = core._collect_media_urls(link_info, child_data, None)
-
-    assert fallback in urls
-    audio_url = core._derive_reddit_audio_url(fallback)
-    assert audio_url in urls
-
-
 def test_normalize_media_filter_tokens_accepts_categories_and_extensions() -> None:
     tokens = normalize_media_filter_tokens(["video", "mp4", "gif"])
     assert tokens == {"video", ".mp4", ".gif"}
@@ -518,7 +504,7 @@ def test_download_media_items_respects_manifest_on_resume(tmp_path: Path) -> Non
             raise AssertionError("Download should be skipped when manifest already records URL")
 
     manifest_path = tmp_path / "media_manifest.json"
-    manifest = {"https://i.redd.it/example.png": "post_media01.png"}
+    manifest = {"https://i.redd.it/example.png": "posts/png/post_media01.png"}
 
     saved = core._download_media_items(
         FakeSession(),
@@ -529,6 +515,7 @@ def test_download_media_items_respects_manifest_on_resume(tmp_path: Path) -> Non
         resume=True,
         manifest=manifest,
         manifest_path=manifest_path,
+    scope="posts",
     )
 
     assert saved == 0
@@ -576,18 +563,10 @@ def test_download_media_items_applies_filters(tmp_path: Path) -> None:
         downloaded_urls=set(),
         resume=False,
         allowed_filters={".mp4"},
+        scope="posts",
     )
 
     assert saved == 1
     assert session.calls == ["https://i.redd.it/example.mp4"]
-    files = list(tmp_path.iterdir())
+    files = list((tmp_path / "posts" / "mp4").glob("*.mp4"))
     assert len(files) == 1
-    assert files[0].suffix == ".mp4"
-
-
-def test_should_download_media_recognizes_audio_category() -> None:
-    audio_url = "https://v.redd.it/example/DASH_audio.mp4"
-    video_url = "https://v.redd.it/example/DASH_720.mp4"
-
-    assert core._should_download_media(audio_url, {"audio"})
-    assert not core._should_download_media(video_url, {"audio"})

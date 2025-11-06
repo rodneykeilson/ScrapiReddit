@@ -343,7 +343,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Comma-separated list of media categories or extensions to download when --download-media is set. "
-            "Supported categories: video, image, animated, audio; extensions: mp4, webm, gif, jpg, png, etc."
+            "Supported categories: video, image, animated; extensions: mp4, webm, gif, jpg, png, etc."
         ),
     )
     parser.add_argument(
@@ -357,7 +357,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--delay",
         type=float,
-        default=5.0,
+        default=3.0,
         help="Delay in seconds between individual post requests (minimum enforced: 1.0).",
     )
     parser.add_argument(

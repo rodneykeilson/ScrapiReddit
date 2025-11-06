@@ -3,7 +3,7 @@
 Scrapi Reddit is a zero-auth toolkit for scraping public Reddit listings. Use the CLI for quick data pulls or import the library to integrate pagination, comment harvesting, and CSV exports into your own workflows. This scraper fetches data from Reddit's Public API and does not require any API key.
 
 ## Features
-- Scrape subreddit listings, the front page, r/popular (geo-aware), r/all, user activity, or custom listing URLs without OAuth.
+- Scrape subreddit posts (with their comments), the front page, r/popular (geo-aware), r/all, user activity, or custom listing URLs without OAuth.
 - Toggle comment collection per post with resumable runs that reuse cached JSON and persist to CSV.
 - Target individual posts to download full comment trees on demand.
 - Automatic pagination, exponential backoff for rate limits, and structured logging with adjustable verbosity.
@@ -14,7 +14,7 @@ Scrapi Reddit is a zero-auth toolkit for scraping public Reddit listings. Use th
 
 ## Important Notes
 - Respect Reddit's [User Agreement](https://www.redditinc.com/policies/user-agreement) and local laws. Scraped data may have legal or ethical constraints.
-- Heavy scraping can trigger rate limits or temporary IP bans. Provide a descriptive User-Agent and keep delays reasonable (I recommend 3 or 4 seconds delay).
+- Heavy scraping can trigger rate limits or temporary IP bans. Keep delays reasonable (I recommend 3 or 4 seconds delay).
 
 ## Dependencies
 - Python 3.9+
@@ -113,12 +113,7 @@ post_target = PostTarget(
 process_post(post_target, session=session, options=options)
 ```
 Both helpers write JSON/CSV to the configured output directory and emit progress via logging.
-When `download_media=True` (or `--download-media` on the CLI) any discoverable images, GIFs, and videos are saved under a `media/` directory per target. Reddit hosts video and audio streams separately, so clips from `v.redd.it` arrive as two files (for example `*_media01.mp4` and `*_media01_audio.mp4`). Merge them with a tool like `ffmpeg -i video.mp4 -i video_audio.mp4 -c copy merged.mp4` if you need the original audio track inline.
-
-## Testing
-```bash
-python -m pytest
-```
+When `download_media=True` (or `--download-media` on the CLI) any discoverable images, GIFs, and videos are saved under a `media/` directory per target. Media is organized by the item that produced it: `media/posts/<format>/` for post attachments and (when comment scraping is enabled) `media/comments/<format>/` for comment attachments. Formats include `mp4`, `webm`, `gif`, `jpg`, and `png`; additional extensions fall back to an `other/` directory. Reddit preview URLs occasionally expire, so you may see warning logs for 404 responses when older links have been removed.
 
 ## Contributing
 Bug reports and pull requests are welcome. For feature requests or questions, please open an issue. When contributing, add tests that cover new behavior and ensure `python -m pytest` passes before submitting a PR.
