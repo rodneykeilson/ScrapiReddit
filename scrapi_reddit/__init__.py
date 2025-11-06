@@ -2,6 +2,7 @@
 from .core import (
     BASE_URL,
     DEFAULT_USER_AGENT,
+    build_search_target,
     ListingTarget,
     PostTarget,
     ScrapeOptions,
@@ -25,6 +26,7 @@ __all__ = [
     "ListingTarget",
     "PostTarget",
     "ScrapeOptions",
+    "build_search_target",
     "build_session",
     "extract_links",
     "fetch_json",

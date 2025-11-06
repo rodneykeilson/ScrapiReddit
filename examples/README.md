@@ -9,6 +9,7 @@ These samples show common Scrapi Reddit setups. Copy one to your project directo
 | `geo-popular.toml` | Monitor r/popular with geo filters and time windows. |
 | `user-activity.toml` | Track a user's submitted, overview, and comments listing. |
 | `mixed-run.toml` | Combo run mixing subreddits, keyword search, and saved posts. |
+| `run_python_api.py` | Script version of the Python API example that writes outputs to `./example_runs`. |
 
 Run any of them like:
 
